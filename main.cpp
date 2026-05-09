@@ -145,3 +145,126 @@ void producer(int id) {
     lock_guard<mutex> lock(g_mutex);
     g_pstat[id].status = "done    ";
 }
+
+void consumer(int id) {
+    while (!g_shutdown) {
+        {
+            lock_guard<mutex> lock(g_mutex);
+            g_cstat[id].status = "sleeping";
+        }
+
+        ms_sleep(rand_range(CONSUME_MIN_MS, CONSUME_MAX_MS));
+        if (g_shutdown) break;
+        {
+            lock_guard<mutex> lock(g_mutex);
+            g_cstat[id].status = "waiting ";
+        }
+
+        while (!g_shutdown) {
+            if (g_full_sem.try_acquire_for(1000)) break;
+        }
+        if (g_shutdown) break;
+
+        int slot, item, snap_count;
+        {
+            lock_guard<mutex> lock(g_mutex);
+            slot         = g_out;
+            item         = g_buf[g_out];
+            g_buf[g_out] = 0;             
+            g_out        = (g_out + 1) % BUFFER_SIZE;
+            g_count--;
+            
+            g_total_consumed++;
+            g_cstat[id].count++;
+            g_cstat[id].last_val = item;
+            g_cstat[id].status = "consumed";
+            snap_count = g_count;
+        }
+
+        g_empty_sem.release();
+
+        log_event("C%d consumed %2d <- slot[%d]  (buf %d/%d)",
+                  id + 1, item, slot, snap_count, BUFFER_SIZE);
+    }
+
+    lock_guard<mutex> lock(g_mutex);
+    g_cstat[id].status = "done    ";
+}
+
+//isbah's section
+
+void print_final_stats() {
+    cout << "\n";
+    cout << "╔══════════════════════════════════════════╗\n";
+    cout << "║      FINAL  SIMULATION  STATISTICS       ║\n";
+    cout << "╠══════════════════════════════════════════╣\n";
+    printf("║  Total produced  : %-21ld ║\n", g_total_produced);
+    printf("║  Total consumed  : %-21ld ║\n", g_total_consumed);
+    printf("║  Items in buffer : %-21d ║\n", g_count);
+    cout << "╠══════════════════════════════════════════╣\n";
+    for (int i = 0; i < NUM_PRODUCERS; i++)
+        printf("║  Producer %d      : %-5ld items produced  ║\n",
+               i + 1, g_pstat[i].count);
+    cout << "║                                          ║\n";
+    for (int i = 0; i < NUM_CONSUMERS; i++)
+        printf("║  Consumer %d      : %-5ld items consumed  ║\n",
+               i + 1, g_cstat[i].count);
+    cout << "╚══════════════════════════════════════════╝\n";
+    cout << "Full log saved to: " << LOG_FILE << "\n\n";
+}
+
+int main() {
+    g_start_time = chrono::system_clock::now();
+
+    signal(SIGINT, signal_handler);
+
+    g_log_file.open(LOG_FILE);
+    if (!g_log_file.is_open()) {
+        cerr << "Failed to open log file" << endl;
+        return 1;
+    }
+    g_log_file << "=== Producer-Consumer Simulation Log ===\n"
+               << "Buffer: " << BUFFER_SIZE << " slots | Producers: " 
+               << NUM_PRODUCERS << " | Consumers: " << NUM_CONSUMERS << "\n\n";
+
+    for (int i = 0; i < NUM_PRODUCERS; i++) {
+        g_pstat[i].id = i;
+    }
+    for (int i = 0; i < NUM_CONSUMERS; i++) {
+        g_cstat[i].id = i;
+    }
+
+    vector<thread> prod_threads;
+    vector<thread> cons_threads;
+
+    for (int i = 0; i < NUM_PRODUCERS; i++) {
+        prod_threads.emplace_back(producer, i);
+    }
+    for (int i = 0; i < NUM_CONSUMERS; i++) {
+        cons_threads.emplace_back(consumer, i);
+    }
+    
+    thread ui_t(ui_thread);
+
+    ui_t.join();
+
+    g_shutdown = true;
+    for (int i = 0; i < NUM_PRODUCERS + NUM_CONSUMERS; i++) {
+        g_full_sem.release();
+        g_empty_sem.release();
+    }
+
+    for (auto& t : prod_threads) {
+        if (t.joinable()) t.join();
+    }
+    for (auto& t : cons_threads) {
+        if (t.joinable()) t.join();
+    }
+    if (g_log_file.is_open()) {
+        g_log_file << "\n=== Simulation ended ===\n";
+        g_log_file.close();
+    }
+
+    print_final_stats();
+    return 0;
+}
